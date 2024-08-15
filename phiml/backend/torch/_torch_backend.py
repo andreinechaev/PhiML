@@ -20,11 +20,21 @@ class TorchBackend(Backend):
 
     def __init__(self):
         cpu = NUMPY.get_default_device()
-        devices = [ComputeDevice(self, "CPU", 'CPU', cpu.memory, cpu.processor_count, cpu.description, ref='cpu')]
-        for index in range(torch.cuda.device_count()):
-            properties = torch.cuda.get_device_properties(index)
-            devices.append(ComputeDevice(self, properties.name, 'GPU', properties.total_memory, properties.multi_processor_count, f"compute capability {properties.major}.{properties.minor}", f'cuda:{index}'))
-        Backend.__init__(self, 'torch', devices, devices[1 if len(devices) > 1 else 0])
+        devices = [ComputeDevice(
+            self, "CPU", 'CPU', cpu.memory, cpu.processor_count, cpu.description, ref='cpu')]
+
+        if torch.cuda.is_available():
+            for index in range(torch.cuda.device_count()):
+                properties = torch.cuda.get_device_properties(index)
+                devices.append(ComputeDevice(self, properties.name, 'GPU', properties.total_memory,
+                               properties.multi_processor_count, f"compute capability {properties.major}.{properties.minor}", f'cuda:{index}'))
+        elif torch.backends.mps.is_available():
+            device = ComputeDevice(
+                self, 'MPS', 'MPS', cpu.memory, 8, 'MPS', 'mps:0')
+            devices.append(device)
+        Backend.__init__(self, 'torch', devices,
+                         devices[1 if len(devices) > 1 else 0])
+        print(f"Initialized TorchBackend with devices {devices}")
 
     def prefers_channels_last(self) -> bool:
         return False
@@ -69,16 +79,15 @@ class TorchBackend(Backend):
                 tensor = torch.from_numpy(x)
             except ValueError:  # or TypeError?
                 tensor = torch.from_numpy(x.copy())
-            tensor = tensor.to(self.get_default_device().ref)
         elif isinstance(x, (tuple, list)):
             try:
                 x = np.stack(x)
-                tensor = torch.tensor(x, device=self.get_default_device().ref)
+                tensor = torch.tensor(x)
             except ValueError:  # there may be Tensors inside the list
                 components = [self.as_tensor(c) for c in x]
                 tensor = torch.stack(components, dim=0)
         else:
-            tensor = torch.tensor(x, device=self.get_default_device().ref)
+            tensor = torch.tensor(x)
         # --- Enforce Precision ---
         if self.is_tensor(tensor, only_native=True):
             dtype = self.dtype(tensor)
@@ -86,6 +95,11 @@ class TorchBackend(Backend):
                 tensor = self.to_float(tensor)
             elif dtype.kind == complex:
                 tensor = self.to_complex(tensor)
+            if torch.backends.mps.is_available() and self.is_sparse(tensor):
+                tensor = tensor.to(torch.device('cpu'))
+            else:
+                tensor = tensor.to(self.get_default_device().ref)
+
         return tensor
 
     def recursive_as_tensor(self, obj):
@@ -104,7 +118,8 @@ class TorchBackend(Backend):
         # return True
         if CURRENT_JIT_CALLS:
             return False
-        return torch._C._get_tracing_state() is None  # TODO can we find out whether this tensor specifically is being traced?
+        # TODO can we find out whether this tensor specifically is being traced?
+        return torch._C._get_tracing_state() is None
 
     def numpy(self, tensor, coalesce=False):
         if tensor.requires_grad:
@@ -159,7 +174,7 @@ class TorchBackend(Backend):
 
     def multi_slice(self, tensor, slices: tuple):
         neg_slices = [i for i, s in enumerate(slices) if isinstance(s, slice) and s.step is not None and s.step < 0]
-        pos_slices = [slice(0 if s.stop is None else s.stop+1, None if s.start is None else s.start+1 or None, -s.step) if i in neg_slices else s for i, s in enumerate(slices)]
+        pos_slices = [slice(0 if s.stop is None else s.stop+1, None if s.start is None else s.start + 1 or None, -s.step) if i in neg_slices else s for i, s in enumerate(slices)]
         sliced = tensor[tuple(pos_slices)]
         return torch.flip(sliced, neg_slices) if neg_slices else sliced
 
@@ -221,6 +236,7 @@ class TorchBackend(Backend):
                 args = [self.numpy(a) if self.is_tensor(a, only_native=True) else a for a in args]
                 result = f(*args, **aux_args)
                 return map_structure(lambda t: self.as_tensor(t), result)
+
             @staticmethod
             def backward(ctx, grad_output):
                 raise NotImplementedError
@@ -229,7 +245,7 @@ class TorchBackend(Backend):
     def jit_compile(self, f: Callable) -> Callable:
         return JITFunction(self, f)
 
-    def custom_gradient(self, f: Callable, gradient: Callable = None, get_external_cache: Callable = None, on_call_skipped: Callable = None, jit_compile = True) -> Callable:
+    def custom_gradient(self, f: Callable, gradient: Callable = None, get_external_cache: Callable = None, on_call_skipped: Callable = None, jit_compile=True) -> Callable:
         """ See PyTorch_Jit.md """
         def select_jit(*args):
             args = [self.as_tensor(arg) for arg in args]
@@ -245,7 +261,8 @@ class TorchBackend(Backend):
                 compiled_function, ext_cache = jit.get_compiled_function(torch_function, args)  # increases counter
                 if on_call_skipped:
                     on_call_skipped(ext_cache)
-                return compiled_function.apply(*args)  # this adds the compiled function to TorchScript. The function must not call any torch functions while being traced lest they be double-executed later.
+                # this adds the compiled function to TorchScript. The function must not call any torch functions while being traced lest they be double-executed later.
+                return compiled_function.apply(*args)
         torch_function = construct_torch_custom_function(f, None, None, gradient, is_f_traced=False, backend=self)
         return select_jit
 
@@ -301,23 +318,25 @@ class TorchBackend(Backend):
         value = torch.permute(value, no_pad_dims + pad_dims)
         if len(no_pad_dims) == 0:
             value = torch.unsqueeze(torch.unsqueeze(value, 0), 0)
-            undo_transform = lambda x: torch.squeeze(torch.squeeze(x, 0), 0)
+            def undo_transform(x): return torch.squeeze(torch.squeeze(x, 0), 0)
         elif len(no_pad_dims) == 1:
             value = torch.unsqueeze(value, 0)
-            undo_transform = lambda x: torch.squeeze(x, 0)
+            def undo_transform(x): return torch.squeeze(x, 0)
         elif len(no_pad_dims) == 2:
-            undo_transform = lambda x: x
+            def undo_transform(x): return x
         else:
             old_shape = value.shape
             value = self.reshape(value, (1, np.prod([value.shape[i] for i in range(len(no_pad_dims))]), *value.shape[len(no_pad_dims):]))
-            undo_transform = lambda x: x.view(*[old_shape[i] for i in range(len(no_pad_dims))], *x.shape[2:])
+
+            def undo_transform(x): return x.view(*[old_shape[i] for i in range(len(no_pad_dims))], *x.shape[2:])
         pad_width_reordered = [pad_width[i] for i in pad_dims]
         pad_width_spatial = [item for sublist in reversed(pad_width_reordered) for item in sublist]  # flatten
         if isinstance(constant_values, torch.Tensor) and constant_values.requires_grad:
             return NotImplemented  # torchf.pad only supports primitive numbers
         constant_values = self.dtype(value).kind(constant_values)
         try:
-            result = torchf.pad(value, pad_width_spatial, mode, value=constant_values)  # supports 3D to 5D (batch, channel, 1D to 3D)
+            # supports 3D to 5D (batch, channel, 1D to 3D)
+            result = torchf.pad(value, pad_width_spatial, mode, value=constant_values)
         except RuntimeError as err:
             warnings.warn(f"PyTorch error {err}", RuntimeWarning)
             return NotImplemented
@@ -329,7 +348,8 @@ class TorchBackend(Backend):
     def grid_sample(self, grid, coordinates, extrapolation: str):
         assert extrapolation in ('undefined', 'zeros', 'boundary', 'periodic', 'symmetric', 'reflect'), extrapolation
         if get_functional_derivative_order() > 1:
-            return NotImplemented  # PyTorch's grid_sample operator does not define higher-order derivatives
+            # PyTorch's grid_sample operator does not define higher-order derivatives
+            return NotImplemented
         extrapolation = {'undefined': 'zeros', 'zeros': 'zeros', 'boundary': 'border', 'reflect': 'reflection'}.get(extrapolation, None)
         if extrapolation is None:
             return NotImplemented
@@ -347,7 +367,8 @@ class TorchBackend(Backend):
         batch_size = combined_dim(coordinates.shape[0], grid.shape[0])
         coordinates = coordinates.repeat(batch_size, *[1] * (len(coordinates.shape-1))) if coordinates.shape[0] < batch_size else coordinates
         grid = grid.repeat(batch_size, *[1] * (len(grid.shape)-1)) if grid.shape[0] < batch_size else grid
-        result = torchf.grid_sample(grid, coordinates, mode='bilinear', padding_mode=extrapolation, align_corners=True)  # can cause segmentation violation if NaN or inf are present
+        # can cause segmentation violation if NaN or inf are present
+        result = torchf.grid_sample(grid, coordinates, mode='bilinear', padding_mode=extrapolation, align_corners=True)
         result = channels_last(result)
         return result
 
@@ -405,7 +426,7 @@ class TorchBackend(Backend):
         quantiles = self.to_float(quantiles)
         result = torch.quantile(x, quantiles, dim=-1)
         return result
-    
+
     def argsort(self, x, axis=-1):
         return torch.argsort(x, axis)
 
@@ -501,7 +522,8 @@ class TorchBackend(Backend):
                 values = loop(*values)
                 if i in max_iter:
                     trj.append(self.copy_leaves(values, only_mutable=True))
-            trj.extend([trj[-1]] * (len(max_iter) - len(trj)))  # fill trj with final values
+            # fill trj with final values
+            trj.extend([trj[-1]] * (len(max_iter) - len(trj)))
             return self.stop_gradient_tree(self.stack_leaves(trj))
         else:
             for i in range(1, max_iter + 1):
@@ -757,7 +779,8 @@ class TorchBackend(Backend):
 
     def cast(self, x, dtype: DType):
         if isinstance(x, (numbers.Number, bool)):
-            return dtype.kind(x)  # Creating a Tensor here would raise warnings during tracing.
+            # Creating a Tensor here would raise warnings during tracing.
+            return dtype.kind(x)
         if not self.is_tensor(x, only_native=True):
             x = self.as_tensor(x)
         if self.dtype(x) == dtype:
@@ -797,7 +820,10 @@ class TorchBackend(Backend):
         row_pointers = self.as_tensor(row_pointers)
         column_indices = self.as_tensor(column_indices)
         values = self.as_tensor(values)
-        return torch.sparse_csr_tensor(row_pointers, column_indices, values, shape, device=values.device)
+        device = values.device
+        if 'mps' in device.type:
+            device = torch.device('cpu')
+        return torch.sparse_csr_tensor(row_pointers, column_indices, values, shape, device=device)
 
     # def csr_matrix_batched(self, column_indices, row_pointers, values, shape: Tuple[int, int]):
     #     batch_size, nnz, channels = values.shape
@@ -840,11 +866,16 @@ class TorchBackend(Backend):
         values, dense = self.auto_cast(values, dense, bool_to_int=True, int_to_float=True)
         batch_size, nnz, channels = values.shape
         result = []
+        device = values.device
+        if 'mps' in values.device.type:
+            warnings.warn("Warning: PyTorch's sparse matrix multiplication is not yet optimized for MPS.")
+            device = torch.device('cpu')
         for b in range(batch_size):
             b_result = []
             for c in range(channels):
-                matrix = torch.sparse_csr_tensor(row_pointers[b], column_indices[b], values[b, :, c].contiguous(), shape, device=values.device)
-                b_result.append(torch.sparse.mm(matrix, self.as_tensor(dense[b, :, c, :])))
+                matrix = torch.sparse_csr_tensor(row_pointers[b], column_indices[b], values[b, :, c].contiguous(), shape, device=device)
+                tensor = self.as_tensor(dense[b, :, c, :]).to(device)
+                b_result.append(torch.sparse.mm(matrix, tensor))
             result.append(torch.stack(b_result, 1))
         return torch.stack(result)
         # if channel_count == 1:
@@ -886,7 +917,8 @@ class TorchBackend(Backend):
         atol = self.as_tensor(atol)
         tol_sq = self.maximum(rtol ** 2 * self.sum(y ** 2, -1), atol ** 2)
         max_iter = self.as_tensor(max_iter[0])
-        x, residual, iterations, function_evaluations, converged, diverged = torch_sparse_cg_adaptive(lin, y, x0, tol_sq, max_iter)
+        x, residual, iterations, function_evaluations, converged, diverged = torch_sparse_cg_adaptive(
+            lin, y, x0, tol_sq, max_iter)
         return SolveResult(f"Φ-ML CG ({'PyTorch*' if self.is_available(y) else 'TorchScript'})", x, residual, iterations, function_evaluations, converged, diverged, [""] * batch_size)
 
     def bi_conjugate_gradient(self, lin, y, x0, rtol, atol, max_iter, pre, matrix_offset, poly_order=2) -> SolveResult:
@@ -941,7 +973,8 @@ class TorchBackend(Backend):
             loss, output = f(*args)
             if np.prod(self.staticshape(loss)) == 1:
                 assert loss.requires_grad, f"Failed to compute gradient because function output does not depend on any input. Inputs: {args}"
-                grads = torch.autograd.grad(loss, wrt_args)  # grad() cannot be called during jit trace
+                # grad() cannot be called during jit trace
+                grads = torch.autograd.grad(loss, wrt_args)
             else:
                 raise NotImplementedError(f"Loss must be reduced to a scalar")
                 grads = torch.autograd.grad(loss, wrt_args, retain_graph=True)
@@ -999,7 +1032,8 @@ class TorchBackend(Backend):
             output = f(*args)
             loss, aux = (output[0], output[1:]) if isinstance(output, (tuple, list)) else (output, None)
             scalar_loss = loss.sum() if loss.ndim > 0 else loss
-            grads = torch.autograd.grad(scalar_loss, wrt_args, create_graph=True, retain_graph=True)  # grad() cannot be called during jit trace
+            # grad() cannot be called during jit trace
+            grads = torch.autograd.grad(scalar_loss, wrt_args, create_graph=True, retain_graph=True)
             hessian = []
             for grad in grads:
                 if not grad.requires_grad:
@@ -1007,7 +1041,8 @@ class TorchBackend(Backend):
                 hessian.append([[] for _ in grads])
                 for lin_index in range(int(np.prod(grad.shape[1:]))):
                     multi_index = np.unravel_index(lin_index, grad.shape[1:])
-                    h = torch.autograd.grad(grad[(slice(None),) + multi_index].sum(), wrt_args, allow_unused=True, retain_graph=True)  # grad of every entry in grad
+                    h = torch.autograd.grad(grad[(slice(None),) + multi_index].sum(
+                    ), wrt_args, allow_unused=True, retain_graph=True)  # grad of every entry in grad
                     # Warning: This returns incorrect values for certain inputs. Hessian of x^2 returns 0 at x=0 but is correct everywhere else.
                     # ToDo torch.autograd.functional.hessian does not seem to have this issue. Wait for torch.vmap(), then conditionally switch.
                     for i, h_ in enumerate(h):
@@ -1076,8 +1111,10 @@ class JITFunction:
         self.backend = backend
         self.f = f
         self.traced = None
-        self.autograd_function_calls = []  # (TorchCustomFunction, args, output, ext_cache, jit_compile?)
-        self.compiled_functions = []  # (TorchCustomFunction, TorchCustomFunction)
+        # (TorchCustomFunction, args, output, ext_cache, jit_compile?)
+        self.autograd_function_calls = []
+        # (TorchCustomFunction, TorchCustomFunction)
+        self.compiled_functions = []
         self.autograd_function_call_counts = 0
         self.called_modules: Set[torch.nn.Module] = set()
 
@@ -1091,7 +1128,8 @@ class JITFunction:
         if self.traced is None:
             self_jit = self
             CURRENT_JIT_CALLS.append(self)
-            self.f(*args)  # records all autograd.Function / nn.Module calls with their args -> self.autograd_function_calls, self.called_modules
+            # records all autograd.Function / nn.Module calls with their args -> self.autograd_function_calls, self.called_modules
+            self.f(*args)
             for i, (rec_function, rec_args, rec_output, _ext_cache, jit) in enumerate(self.autograd_function_calls):
                 if jit:
                     self.compiled_functions.append((rec_function, rec_function.compile(rec_args, rec_output)))
@@ -1104,7 +1142,7 @@ class JITFunction:
                 def __init__(self):
                     super().__init__()
                     for submodule in self_jit.called_modules:
-                        self.add_module(str(f"{type(submodule).__name__}_{id(submodule)}"), submodule)
+                        self.add_module(str(f"{type(submodule).__name__}_{d(submodule)}"), submodule)
 
                 def forward(self, *args):
                     ML_LOGGER.debug(f"Tracing Pytorch jit module for {self_jit.f.__name__}")
@@ -1122,7 +1160,8 @@ class JITFunction:
         return choose_backend(self).call(self.traced, *args, name=f"run jit-compiled '{self.f.__name__}'")
 
     def record_autograd_function_call(self, function: torch.autograd.Function, args, output, ext_cache, jit_compile=True):
-        self.autograd_function_calls.append((function, args, output, ext_cache, jit_compile))
+        self.autograd_function_calls.append(
+            (function, args, output, ext_cache, jit_compile))
 
     def get_compiled_function(self, function: torch.autograd.Function, args) -> Tuple[torch.autograd.Function, Any]:
         assert torch._C._get_tracing_state() is not None
@@ -1138,7 +1177,8 @@ class JITFunction:
         return f"TorchScript[{self.f.__name__}]"
 
 
-CURRENT_JIT_CALLS: List[JITFunction] = []  # should contain no more than 1 element; PyTorch doesn't support nested tracing
+# should contain no more than 1 element; PyTorch doesn't support nested tracing
+CURRENT_JIT_CALLS: List[JITFunction] = []
 
 
 def register_module_call(module: torch.nn.Module):
@@ -1157,7 +1197,8 @@ def construct_torch_custom_function(f: Callable, jit_f: Optional[Callable], f_ex
         """ See PyTorch_Jit.md """
 
         @staticmethod
-        def forward(ctx, *args, **kwargs):  # The result of this is used in the graph.
+        # The result of this is used in the graph.
+        def forward(ctx, *args, **kwargs):
             if torch._C._get_tracing_state():
                 ML_LOGGER.debug(f"torch.jit.trace encountered forward pass of {f.__name__}. Returning cached output to avoid double execution: {[(tuple(o.shape), o.requires_grad if isinstance(o, torch.Tensor) else type(o)) for o in f_example_output]}")
                 # jit_context = CURRENT_JIT_CALLS[-1]; jit_context.cached_output[torch_custom_function]
@@ -1181,11 +1222,13 @@ def construct_torch_custom_function(f: Callable, jit_f: Optional[Callable], f_ex
                 if not jit_g:
                     # backward pass can return None but that's not allowed in JIT functions
                     needs_input_grad = ctx.needs_input_grad
-                    none_indices = []  # jit function cannot return None but gradient returns None to indicate there is no gradient
+                    # jit function cannot return None but gradient returns None to indicate there is no gradient
+                    none_indices = []
 
                     def filter_required_grads(*args):  # traced once
                         grads = g(*args)
-                        filtered = [gv for gv, need in zip(grads, needs_input_grad) if need]
+                        filtered = [gv for gv, need in zip(
+                            grads, needs_input_grad) if need]
                         none_indices.clear()
                         none_indices.extend([i for i, g in enumerate(filtered) if g is None])
                         filtered = [gv for gv in filtered if gv is not None]
@@ -1264,23 +1307,29 @@ _FROM_TORCH = {np: dtype for dtype, np in _TO_TORCH.items()}
 def torch_sparse_cg(lin, y, x0, tolerance_sq, max_iter):
     batch_size = y.shape[0]
     x = x0
-    dx = residual = y - sparse_matmul(lin, x)
+    mm = sparse_matmul(lin, x)
+    dx = residual = y - mm
     it_counter = torch.tensor(0, dtype=torch.int32, device=x.device)
     iterations = torch.zeros([batch_size], dtype=torch.int32, device=x.device)
     function_evaluations = torch.ones([batch_size], dtype=torch.int32, device=x.device)
     residual_squared = rsq0 = torch.sum(residual ** 2, -1, keepdim=True)
     diverged = torch.any(~torch.isfinite(x), dim=1)
     converged = torch.all(residual_squared <= tolerance_sq, dim=1)
-    finished = converged | diverged | (iterations >= max_iter); not_finished_1 = (~finished).to(torch.int32)
+    finished = converged | diverged | (iterations >= max_iter)
+    not_finished_1 = (~finished).to(torch.int32)
     while ~torch.all(finished):
-        it_counter += 1; iterations += not_finished_1
-        dy = sparse_matmul(lin, dx); function_evaluations += not_finished_1
+        it_counter += 1
+        iterations += not_finished_1
+        dy = sparse_matmul(lin, dx)
+        function_evaluations += not_finished_1
         dx_dy = torch.sum(dx * dy, dim=-1, keepdim=True)
         step_size = divide_no_nan(residual_squared, dx_dy)
-        step_size *= torch.unsqueeze(not_finished_1.to(y.dtype), -1)  # this is not really necessary but ensures batch-independence
+        # this is not really necessary but ensures batch-independence
+        step_size *= torch.unsqueeze(not_finished_1.to(y.dtype), -1)
         x += step_size * dx
         if it_counter % 20 == 0:
-            residual = y - sparse_matmul(lin, x); function_evaluations += 1
+            residual = y - sparse_matmul(lin, x)
+            function_evaluations += 1
         else:
             residual = residual - step_size * dy  # in-place subtraction affects convergence
         residual_squared_old = residual_squared
@@ -1288,7 +1337,8 @@ def torch_sparse_cg(lin, y, x0, tolerance_sq, max_iter):
         dx = residual + divide_no_nan(residual_squared, residual_squared_old) * dx
         diverged = torch.any(residual_squared / rsq0 > 100, dim=1) & (iterations >= 8)
         converged = torch.all(residual_squared <= tolerance_sq, dim=1)
-        finished = converged | diverged | (iterations >= max_iter); not_finished_1 = (~finished).to(torch.int32)
+        finished = converged | diverged | (iterations >= max_iter)
+        not_finished_1 = (~finished).to(torch.int32)
     return x, residual, iterations, function_evaluations, converged, diverged
 
 
@@ -1303,29 +1353,41 @@ def torch_sparse_cg_adaptive(lin, y, x0, tolerance_sq, max_iter):
     residual_squared = rsq0 = torch.sum(residual ** 2, -1, keepdim=True)
     diverged = torch.any(~torch.isfinite(x), dim=1)
     converged = torch.all(residual_squared <= tolerance_sq, dim=1)
-    finished = converged | diverged | (iterations >= max_iter); not_finished_1 = (~finished).to(torch.int32)
+    finished = converged | diverged | (iterations >= max_iter)
+    not_finished_1 = (~finished).to(torch.int32)
     while ~torch.all(finished):
-        it_counter += 1; iterations += not_finished_1
-        dy = sparse_matmul(lin, dx); function_evaluations += not_finished_1
+        it_counter += 1
+        iterations += not_finished_1
+        dy = sparse_matmul(lin, dx)
+        function_evaluations += not_finished_1
         dx_dy = torch.sum(dx * dy, dim=-1, keepdim=True)
         step_size = divide_no_nan(torch.sum(dx * residual, dim=1, keepdim=True), dx_dy)
-        step_size *= torch.unsqueeze(not_finished_1.to(y.dtype), -1)  # this is not really necessary but ensures batch-independence
+        # this is not really necessary but ensures batch-independence
+        step_size *= torch.unsqueeze(not_finished_1.to(y.dtype), -1)
         x += step_size * dx
         if it_counter % 20 == 0:
-            residual = y - sparse_matmul(lin, x); function_evaluations += 1
+            residual = y - sparse_matmul(lin, x)
+            function_evaluations += 1
         else:
             residual = residual - step_size * dy  # in-place subtraction affects convergence
         residual_squared = torch.sum(residual ** 2, -1, keepdim=True)
         dx = residual - divide_no_nan(torch.sum(residual * dy, dim=1, keepdim=True) * dx, dx_dy)
         diverged = torch.any(residual_squared / rsq0 > 100, dim=1) & (iterations >= 8)
         converged = torch.all(residual_squared <= tolerance_sq, dim=1)
-        finished = converged | diverged | (iterations >= max_iter); not_finished_1 = (~finished).to(torch.int32)
+        finished = converged | diverged | (iterations >= max_iter)
+        not_finished_1 = (~finished).to(torch.int32)
     return x, residual, iterations, function_evaluations, converged, diverged
 
 
 def sparse_matmul(matrix: torch.Tensor, b: torch.Tensor):
     if matrix.is_sparse or matrix.is_sparse_csr:
-        return torch.transpose(torch.sparse.mm(matrix, torch.transpose(b, 0, 1)), 0, 1)
+        orig_device = b.device
+        T = torch.transpose(b, 0, 1)
+        if torch.backends.mps.is_available():
+            device = torch.device('cpu')
+            matrix = matrix.to(device=device)
+            T = T.to(device=device)
+        return torch.transpose(torch.sparse.mm(matrix, T), 0, 1).to(device=orig_device)
     else:
         return torch.transpose(torch.matmul(matrix, torch.transpose(b, 0, 1)), 0, 1)
 
