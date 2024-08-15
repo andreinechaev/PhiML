@@ -52,11 +52,11 @@ class ComputeDevice:
     """
 
     def __init__(self, backend: 'Backend', name: str, device_type: str, memory: int, processor_count: int, description: str, ref):
-        assert device_type in ('CPU', 'GPU', 'TPU')
+        assert device_type in ('CPU', 'GPU', 'TPU', 'MPS')
         self.name: str = name
         """ Name of the compute device. CPUs are typically called `'CPU'`. """
         self.device_type: str = device_type
-        """ Type of device such as `'CPU'`, `'GPU'` or `'TPU'`. """
+        """ Type of device such as `'CPU'`, `'GPU'` or `'TPU'` or `'MPS'`. """
         self.memory: int = memory
         """ Maximum memory of the device that can be allocated (in bytes). -1 for n/a. """
         self.processor_count: int = processor_count
