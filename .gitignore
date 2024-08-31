@@ -10,3 +10,6 @@ data/*
 test_data/*
 .cache
 run_tests.sh
+
+*.egg-info
+build/
