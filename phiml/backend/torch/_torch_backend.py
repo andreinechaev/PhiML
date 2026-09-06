@@ -1,7 +1,7 @@
 import numbers
 import warnings
 from functools import wraps
-from typing import List, Callable, Optional, Set, Tuple, Any, Union, Sequence
+from typing import List, Callable, Optional, Set, Tuple, Any, Union, Sequence, override
 
 import numpy as np
 import torch
@@ -36,6 +36,7 @@ class TorchBackend(Backend):
         from . import nets
         return nets
 
+    @override
     def is_tensor(self, x, only_native=False):
         if isinstance(x, torch.Tensor):
             return True

@@ -173,7 +173,7 @@ class Backend:
     def auto_cast(self, *tensors, bool_to_int=False, int_to_float=False) -> list:
         """
         Determins the appropriate values type resulting from operations involving the tensors as input.
-        
+
         This method is called by the default implementations of basic operators.
         Backends can override this method to prevent unnecessary casting.
 
@@ -338,7 +338,7 @@ class Backend:
         Converts a tensor-like object to the native tensor representation of this backend.
         If x is a native tensor of this backend, it is returned without modification.
         If x is a Python number (numbers.Number instance), `convert_numbers` decides whether to convert it unless the backend cannot handle Python numbers.
-        
+
         *Note:* There may be objects that are considered tensors by this backend but are not native and thus, will be converted by this method.
 
         Args:
@@ -355,7 +355,7 @@ class Backend:
         """
         Tests if the value of the tensor is known and can be read at this point.
         If true, `numpy(tensor)` must return a valid NumPy representation of the value.
-        
+
         Tensors are typically available when the backend operates in eager mode.
 
         Args:
@@ -371,7 +371,7 @@ class Backend:
         """
         Returns a NumPy representation of the given tensor.
         If `tensor` is already a NumPy array, it is returned without modification.
-        
+
         This method raises an error if the value of the tensor is not known at this point, e.g. because it represents a node in a graph.
         Use `is_available(tensor)` to check if the value can be represented as a NumPy array.
 
@@ -551,7 +551,7 @@ class Backend:
     def pad(self, value, pad_width, mode: str = 'constant', constant_values=0):
         """
         Pad a tensor with values as specified by `mode` and `constant_values`.
-        
+
         If the mode is not supported, returns NotImplemented.
 
         Args:
@@ -1759,6 +1759,14 @@ def init_installed_backends() -> tuple:
         All installed tensor backends as `tuple[Backend]`
     """
     try:
+        init_backend('mlx')
+    except ImportError:
+        pass
+    try:
+        init_backend('tinygrad')
+    except ImportError:
+        pass
+    try:
         init_backend('jax')
     except ImportError:
         pass
@@ -1790,6 +1798,16 @@ def init_backend(backend: str) -> Sequence[Backend]:
         backends = tuple(sys.modules)
     else:
         backends = [s.strip() for s in backend.split(',')]
+    if 'mlx' in backends and not is_initialized('mlx'):
+        ML_LOGGER.info("Initializing backend 'mlx'")
+        from .mlx import MLX
+        BACKENDS.append(MLX)
+        result.append(MLX)
+    if 'tinygrad' in backends and not is_initialized('tinygrad'):
+        ML_LOGGER.info("Initializing backend 'tinygrad'")
+        from .tinygrad import TINY_GRAD
+        BACKENDS.append(TINY_GRAD)
+        result.append(TINY_GRAD)
     if ('jax' in backends or 'jaxlib' in backends) and not is_initialized('jax'):
         ML_LOGGER.info("Initializing backend 'jax'")
         from .jax import JAX
@@ -1821,6 +1839,12 @@ def get_backend(backend):
     if not is_initialized(backend):
         return init_backend(backend)[0]
     else:
+        if backend == 'mlx':
+            from .mlx import MLX
+            return MLX
+        if backend == 'tinygrad':
+            from .tinygrad import TINY_GRAD
+            return TINY_GRAD
         if backend == 'numpy':
             from . import NUMPY
             return NUMPY
@@ -2082,6 +2106,7 @@ def disassemble_dataclass(data):
         assemblers.append(assemble)
         indices.append(len(tensors))
         tensors.extend(tensor_list)
+
     def assemble(b: Backend, *args):
         re_values = {}
         for i, (start, end) in enumerate(zip(indices, indices[1:] + [len(tensors)])):

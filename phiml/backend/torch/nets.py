@@ -101,11 +101,11 @@ ACTIVATIONS = {'ReLU': nn.ReLU, 'Sigmoid': nn.Sigmoid, 'tanh': nn.Tanh, 'SiLU': 
 
 
 def mlp(in_channels: int,
-              out_channels: int,
-              layers: Sequence[int],
-              batch_norm=False,
-              activation: Union[str, Callable] = 'ReLU',
-              softmax=False) -> nn.Module:
+        out_channels: int,
+        layers: Sequence[int],
+        batch_norm=False,
+        activation: Union[str, Callable] = 'ReLU',
+        softmax=False) -> nn.Module:
     layers = [in_channels, *layers, out_channels]
     activation = ACTIVATIONS[activation] if isinstance(activation, str) else activation
     net = DenseNet(layers, activation, batch_norm, softmax)
@@ -185,6 +185,7 @@ def u_net(in_channels: int,
     else:
         assert isinstance(in_spatial, tuple)
         d = len(in_spatial)
+
     net = UNet(d, in_channels, out_channels, filters, batch_norm, activation, periodic, use_res_blocks, down_kernel_size, up_kernel_size)
     return net.to(TORCH.get_default_device().ref)
 
@@ -201,7 +202,7 @@ class UNet(nn.Module):
             self.add_module('inc', DoubleConv(d, in_channels, filters[0], filters[0], batch_norm, activation, periodic, down_kernel_size))
         for i in range(1, self._levels):
             self.add_module(f'down{i}', Down(d, filters[i - 1], filters[i], batch_norm, activation, periodic, use_res_blocks, down_kernel_size))
-            self.add_module(f'up{i}', Up(d, filters[i] + filters[i - 1], filters[i - 1], batch_norm, activation, periodic, use_res_blocks, up_kernel_size))
+            self.add_module(f'up{i}', Up(d, filters[i], filters[i - 1], batch_norm, activation, periodic, use_res_blocks, up_kernel_size))
         self.add_module('outc', CONV[d](filters[0], out_channels, kernel_size=1))
 
     def forward(self, x):

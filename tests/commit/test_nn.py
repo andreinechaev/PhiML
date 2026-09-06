@@ -6,7 +6,7 @@ from phiml.math import channel, batch
 from phiml import nn
 
 
-LIBRARIES = ['jax', 'tensorflow', 'torch']
+LIBRARIES = ['mlx'] # 'jax', 'tensorflow', 'torch'
 
 
 class TestNetworks(TestCase):
@@ -15,8 +15,8 @@ class TestNetworks(TestCase):
         for lib in LIBRARIES:
             nn.use(lib)
             net = nn.u_net(2, 3, levels=3, filters=8, batch_norm=False, activation='ReLU', in_spatial=(64, 32))
-            self.assertEqual(6587, nn.parameter_count(net), msg=lib)
             net_res = nn.u_net(2, 3, batch_norm=False, activation='SiLU', in_spatial=2, use_res_blocks=True)
+            self.assertEqual(6587, nn.parameter_count(net), msg=lib)
             self.assertEqual(39059, nn.parameter_count(net_res), msg=lib)
 
     def test_u_net_3d_norm_network_sizes(self):

@@ -49,7 +49,8 @@ def parameter_count(net: Network) -> int:
     Returns:
         Total parameter count as `int`.
     """
-    return sum([value.shape.volume for name, value in get_parameters(net).items()])
+    # return sum([value.shape.volume for name, value in get_parameters(net).items()])
+    return sum(v.size for _, v in get_parameters(net).items())
 
 
 def get_parameters(net: Network) -> Dict[str, Tensor]:
@@ -145,11 +146,11 @@ def rmsprop(net: Network, learning_rate: float = 1e-3, alpha=0.99, eps=1e-08, we
 
 
 def mlp(in_channels: int,
-              out_channels: int,
-              layers: Sequence[int],
-              batch_norm=False,
-              activation: Union[str, Callable] = 'ReLU',
-              softmax=False) -> Network:
+        out_channels: int,
+        layers: Sequence[int],
+        batch_norm=False,
+        activation: Union[str, Callable] = 'ReLU',
+        softmax=False) -> Network:
     """
     Fully-connected neural networks are available in Φ-ML via mlp().
 
